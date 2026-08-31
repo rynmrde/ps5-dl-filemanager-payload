@@ -22,8 +22,11 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
+#include <new>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -162,6 +165,17 @@ static bool safe_join(const std::string &dest, const char *rel,
     if (!out.empty() && out.back() != '/') out += '/';
     out += r;
     return out.size() < P5_MAX_PATH;
+}
+
+static bool split_destination(const std::string &full, std::string &parent,
+                              std::string &name)
+{
+    const size_t slash = full.find_last_of('/');
+    if (slash == std::string::npos || slash + 1 >= full.size())
+        return false;
+    parent = full.substr(0, slash);
+    name = full.substr(slash + 1);
+    return !parent.empty() && !name.empty();
 }
 
 /* Writer thread: drains DecodedBufs, streams them to per-member files. */
@@ -309,8 +323,11 @@ static void producer_main(Engine *e)
         /* Hand the member to libunrar for direct-to-disk extract; writers
          * stay busy with queued buffers from earlier reads, preserving
          * overlap. Push an empty eof marker so writers sequence members. */
-        if (mkdirs_for(full) == P5_OK) {
-            int prc = RARProcessFile(h, RAR_OM_EXTRACT, e->dest.c_str(), NULL);
+        std::string parent, name;
+        if (split_destination(full, parent, name) &&
+            mkdirs_for(parent) == P5_OK) {
+            int prc = RARProcessFile(h, RAR_OM_EXTRACT, parent.c_str(),
+                                     name.c_str());
             if (prc != ERAR_SUCCESS && prc != ERAR_END_ARCHIVE) {
                 e->rar_error.store(prc);
                 break;

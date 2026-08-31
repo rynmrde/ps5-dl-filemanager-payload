@@ -69,6 +69,10 @@ static p5_status ws_flush(wr_stream *ws)
             ws->error = true;
             return P5_ERR_IO;
         }
+        if (n == 0) {
+            ws->error = true;
+            return P5_ERR_IO;
+        }
         w += (size_t)n;
     }
     ws->file_off += ws->used;
@@ -349,8 +353,14 @@ p5_status p5_ffpfsc_pack(const char *src_dir, const char *out_path,
         uint64_t nrecs = (uint64_t)c.nrecs;
         memcpy(hdr + 8,  &nrecs, 8);
         memcpy(hdr + 16, &index_offset, 8);
-        if (pwrite(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr))
-            rc = P5_ERR_IO;
+        size_t written = 0;
+        while (written < sizeof(hdr)) {
+            ssize_t n = pwrite(fd, hdr + written, sizeof(hdr) - written,
+                               (off_t)written);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { rc = P5_ERR_IO; break; }
+            written += (size_t)n;
+        }
     }
 
     free(c.recs);

@@ -202,6 +202,7 @@ struct p5_dl {
     atomic_ullong bytes_done;    /* fetched across all chunks   */
     atomic_int    state;         /* 0 run, 1 pause, 2 cancel    */
     atomic_int    failures;
+    pthread_mutex_t sidecar_lock;
     uint64_t      start_ms;
 };
 
@@ -217,6 +218,7 @@ typedef struct {
 
 static void sidecar_save(p5_dl *dl)
 {
+    pthread_mutex_lock(&dl->sidecar_lock);
     sidecar_hdr h;
     memset(&h, 0, sizeof(h));
     h.magic      = SIDECAR_MAGIC;
@@ -226,9 +228,20 @@ static void sidecar_save(p5_dl *dl)
         h.chunks[i] = dl->chunks[i];
 
     int fd = open(dl->sidecar, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
-    (void)!write(fd, &h, sizeof(h));
+    if (fd < 0) {
+        pthread_mutex_unlock(&dl->sidecar_lock);
+        return;
+    }
+    size_t written = 0;
+    while (written < sizeof(h)) {
+        ssize_t n = write(fd, (const uint8_t *)&h + written,
+                          sizeof(h) - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
     close(fd);
+    pthread_mutex_unlock(&dl->sidecar_lock);
 }
 
 static bool sidecar_load(p5_dl *dl)
@@ -260,16 +273,20 @@ static int http_request(p5_dl *dl, p5_dl_transport *t, const p5_url *u,
                         uint64_t range_to /* UINT64_MAX = open-ended */)
 {
     char req[2048];
+    char range_end[24];
     int len;
     if (range_to != UINT64_MAX || range_from > 0) {
+        if (range_to != UINT64_MAX)
+            snprintf(range_end, sizeof(range_end), "%llu",
+                     (unsigned long long)range_to);
+        else
+            range_end[0] = '\0';
         len = snprintf(req, sizeof(req),
             "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: ps5-payload/" P5_VERSION
             "\r\nAccept: */*\r\nRange: bytes=%llu-%s\r\nConnection: close\r\n\r\n",
             method, u->path, u->host,
             (unsigned long long)range_from,
-            range_to == UINT64_MAX ? "" : ({ char tmp[24];
-                snprintf(tmp, sizeof(tmp), "%llu",
-                         (unsigned long long)range_to); tmp; }));
+            range_end);
     } else {
         len = snprintf(req, sizeof(req),
             "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: ps5-payload/" P5_VERSION
@@ -284,7 +301,9 @@ static int http_request(p5_dl *dl, p5_dl_transport *t, const p5_url *u,
 /* Read response headers; returns HTTP status, fills content_length/-ranges. */
 static int http_read_headers(p5_dl *dl, p5_dl_transport *t,
                              int64_t *content_length, bool *accept_ranges,
-                             char *location, size_t location_cap)
+                             char *location, size_t location_cap,
+                             uint8_t *body_prefix, size_t body_cap,
+                             size_t *body_len)
 {
     char hdr[HEADER_CAP];
     size_t used = 0;
@@ -298,8 +317,16 @@ static int http_read_headers(p5_dl *dl, p5_dl_transport *t,
             return -1;
         used += (size_t)n;
         hdr[used] = '\0';
-        if (strstr(hdr, "\r\n\r\n"))
+        char *marker = strstr(hdr, "\r\n\r\n");
+        if (marker) {
+            size_t header_len = (size_t)(marker - hdr) + 4;
+            size_t extra = used - header_len;
+            if (extra > body_cap) return -1;
+            if (extra && body_prefix)
+                memcpy(body_prefix, hdr + header_len, extra);
+            if (body_len) *body_len = extra;
             break;
+        }
     }
 
     int status = 0;
@@ -358,7 +385,7 @@ static p5_status resolve_target(p5_dl *dl, p5_url *final, int64_t *size_out,
             int64_t clen = -1; bool ranges = false;
             char loc[P5_MAX_URL];
             int status = http_read_headers(dl, t, &clen, &ranges, loc,
-                                           sizeof(loc));
+                                           sizeof(loc), NULL, 0, NULL);
             t->close(t->ctx); free(t);
 
             if (status >= 300 && status < 400 && loc[0]) {
@@ -411,7 +438,8 @@ static void *worker_main(void *varg)
     }
     {
         int64_t clen = -1; bool ranges = false;
-        int status = http_read_headers(dl, t, &clen, &ranges, NULL, 0);
+        int status = http_read_headers(dl, t, &clen, &ranges, NULL, 0,
+                                       buf, P5_DL_BUFFER_CAP, &buffered);
         if (status != 206 && !(status == 200 && dl->nchunks == 1)) {
             result = P5_ERR_HTTP;
             goto out;
@@ -437,10 +465,15 @@ static void *worker_main(void *varg)
 
         if (buffered >= P5_DL_BUFFER_CAP) {
             off_t off = (off_t)(ch->start + ch->fetched);
-            if (pwrite(dl->fd, buf, buffered, off) != (ssize_t)buffered) {
-                result = P5_ERR_IO;
-                break;
+            size_t written = 0;
+            while (written < buffered) {
+                ssize_t n = pwrite(dl->fd, buf + written, buffered - written,
+                                   off + (off_t)written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) { result = P5_ERR_IO; break; }
+                written += (size_t)n;
             }
+            if (result != P5_OK) break;
             ch->fetched += buffered;
             atomic_fetch_add(&dl->bytes_done, buffered);
             buffered = 0;
@@ -451,9 +484,15 @@ static void *worker_main(void *varg)
     /* Final flush of the tail. */
     if (buffered > 0 && result == P5_OK) {
         off_t off = (off_t)(ch->start + ch->fetched);
-        if (pwrite(dl->fd, buf, buffered, off) != (ssize_t)buffered)
-            result = P5_ERR_IO;
-        else {
+        size_t written = 0;
+        while (written < buffered) {
+            ssize_t n = pwrite(dl->fd, buf + written, buffered - written,
+                               off + (off_t)written);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { result = P5_ERR_IO; break; }
+            written += (size_t)n;
+        }
+        if (result == P5_OK) {
             ch->fetched += buffered;
             atomic_fetch_add(&dl->bytes_done, buffered);
         }
@@ -492,6 +531,7 @@ p5_status p5_dl_create(p5_dl **out, const char *url, const char *dest_path,
     if (!dl->opts.connections || dl->opts.connections > P5_DL_MAX_CONN)
         dl->opts.connections = 4;
     dl->fd = -1;
+    pthread_mutex_init(&dl->sidecar_lock, NULL);
     *out = dl;
     return P5_OK;
 }
@@ -539,18 +579,21 @@ p5_status p5_dl_start(p5_dl *dl)
 
     pthread_t tids[P5_DL_MAX_CONN];
     worker_arg args[P5_DL_MAX_CONN];
-    uint32_t launched = 0;
+    bool started[P5_DL_MAX_CONN] = { false };
     for (uint32_t i = 0; i < dl->nchunks; i++) {
         if (dl->chunks[i].fetched >= dl->chunks[i].end - dl->chunks[i].start)
             continue;                        /* chunk already complete */
         args[i].dl = dl; args[i].idx = i; args[i].url = final;
-        if (pthread_create(&tids[i], NULL, worker_main, &args[i]) == 0)
-            launched++;
+        if (pthread_create(&tids[i], NULL, worker_main, &args[i]) == 0) {
+            started[i] = true;
+        } else {
+            atomic_fetch_add(&dl->failures, 1);
+        }
     }
 
     /* Progress pump on the caller thread while workers run. */
-    for (uint32_t i = 0; i < launched; i++)
-        pthread_join(tids[i], NULL);
+    for (uint32_t i = 0; i < dl->nchunks; i++)
+        if (started[i]) pthread_join(tids[i], NULL);
 
     uint64_t done = atomic_load(&dl->bytes_done);
     int state = atomic_load(&dl->state);
@@ -594,5 +637,6 @@ void p5_dl_destroy(p5_dl *dl)
 {
     if (!dl) return;
     if (dl->fd >= 0) close(dl->fd);
+    pthread_mutex_destroy(&dl->sidecar_lock);
     free(dl);
 }
