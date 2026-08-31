@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install SDK prerequisites
-        run: sudo apt-get update && sudo apt-get install -y clang-18 lld-18 unzip
+        run: sudo apt-get update && sudo apt-get install -y clang-18 lld-18 llvm-18 llvm-18-dev llvm-18-tools unzip
 
       - name: Install official PS5 payload SDK
         run: |
