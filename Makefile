@@ -14,7 +14,8 @@ TARGET    := payload.elf
 
 CFLAGS    := -O2 -fPIC -funwind-tables -Wall -Wextra -Wshadow -fno-strict-aliasing \
              -target x86_64-pc-freebsd12-elf -march=znver2 -mtune=znver2 \
-             -Iinclude
+             -Iinclude -isystem $(PS5_PAYLOAD_SDK)/target/include \
+             -isystem $(PS5_PAYLOAD_SDK)/target/include_common
 CXXFLAGS  := $(CFLAGS) -std=c++17 -fno-exceptions -fno-rtti
 CFLAGS    += -std=c11
 LDFLAGS   := -L$(PS5_PAYLOAD_SDK)/target/lib \

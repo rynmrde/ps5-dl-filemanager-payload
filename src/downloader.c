@@ -272,6 +272,7 @@ static int http_request(p5_dl *dl, p5_dl_transport *t, const p5_url *u,
                         const char *method, uint64_t range_from,
                         uint64_t range_to /* UINT64_MAX = open-ended */)
 {
+    (void)dl;
     char req[2048];
     char range_end[24];
     int len;
@@ -467,11 +468,11 @@ static void *worker_main(void *varg)
             off_t off = (off_t)(ch->start + ch->fetched);
             size_t written = 0;
             while (written < buffered) {
-                ssize_t n = pwrite(dl->fd, buf + written, buffered - written,
-                                   off + (off_t)written);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) { result = P5_ERR_IO; break; }
-                written += (size_t)n;
+                ssize_t nw = pwrite(dl->fd, buf + written, buffered - written,
+                                    off + (off_t)written);
+                if (nw < 0 && errno == EINTR) continue;
+                if (nw <= 0) { result = P5_ERR_IO; break; }
+                written += (size_t)nw;
             }
             if (result != P5_OK) break;
             ch->fetched += buffered;
